@@ -1,0 +1,31 @@
+{
+  // Copy this into your project's .vscode/tasks.json.
+  // Run with: Ctrl+Shift+P -> "Tasks: Run Task" -> "jbacon: watch"
+  // It opens in a dedicated terminal panel and stays resident, like bacon.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "jbacon: watch",
+      "type": "shell",
+      "command": "jbacon",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      // Diagnostics in the Problems panel come from the Java language server
+      // (Extension Pack for Java). Leave this empty to avoid double counting.
+      "problemMatcher": [],
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    },
+    {
+      "label": "jbacon: check once (CI style)",
+      "type": "shell",
+      "command": "jbacon --once",
+      "problemMatcher": []
+    }
+  ]
+}

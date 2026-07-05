@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+# jbacon - a bacon-like background code checker for Maven projects.
+#
+# Design goals (mirrors bacon for Rust):
+#   - resident: watches sources, rebuilds on save
+#   - light: pure Python stdlib, no dependencies, mtime polling
+#   - clear: errors before warnings, first error at the top, no scrolling needed
+#   - fast to drive: one-key job switching (c/t/v/p...), like bacon's t/c/d
+#   - keeps the previous result on screen while the next build runs
+#
+# Requires: Python 3.11+ (tomllib), Linux/macOS terminal. Uses mvnd if found.
+
+import argparse
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
+# ---------------------------------------------------------------- constants
+
+VERSION = "0.1.0"
+
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+RED = "\x1b[31m"
+YELLOW = "\x1b[33m"
+GREEN = "\x1b[32m"
+CYAN = "\x1b[36m"
+MAGENTA = "\x1b[35m"
+INVERT = "\x1b[7m"
+
+ALT_ON = "\x1b[?1049h"
+ALT_OFF = "\x1b[?1049l"
+CURSOR_HIDE = "\x1b[?25l"
+CURSOR_SHOW = "\x1b[?25h"
+HOME = "\x1b[H"
+CLEAR_EOL = "\x1b[K"
+CLEAR_BELOW = "\x1b[J"
+
+SPINNER = "|/-\\"
+
+DEFAULT_JOBS = {
+    "check":   {"key": "c", "goals": ["test-compile"],          "desc": "compile main + test sources"},
+    "test":    {"key": "t", "goals": ["test"],                  "desc": "run tests"},
+    "verify":  {"key": "v", "goals": ["verify"],                "desc": "full verify (checks, ITs)"},
+    "package": {"key": "p", "goals": ["package", "-DskipTests"], "desc": "package without tests"},
+}
+
+RESERVED_KEYS = set("roqshjkgG")
+
+# Maven compiler / plugin message with a source location:
+#   [ERROR] /abs/path/Foo.java:[12,5] ';' expected
+LOC_RE = re.compile(r"^\[(ERROR|WARNING)\]\s+(.+?\.java):\[(\d+)(?:,(\d+))?\]\s*(.*)$")
+# Any other [ERROR] / [WARNING] line:
+GEN_RE = re.compile(r"^\[(ERROR|WARNING)\]\s?(.*)$")
+TESTS_RE = re.compile(r"Tests run:\s*\d+.*")
+
+NOISE_PREFIXES = (
+    "To see the full stack trace",
+    "Re-run Maven",
+    "For more information about the errors",
+    "COMPILATION ERROR",
+    "-> [Help",
+    "[Help ",
+    "Failures:",
+    "Errors:",
+    "Please refer to",
+)
+
+# ---------------------------------------------------------------- model
+
+
+class Item:
+    """One diagnostic: an error or a warning, with or without a location."""
+
+    __slots__ = ("sev", "path", "line", "col", "msg")
+
+    def __init__(self, sev, path, line, col, msg):
+        self.sev = sev          # "ERROR" | "WARNING"
+        self.path = path        # relative path or None
+        self.line = line        # int or None
+        self.col = col          # int or None
+        self.msg = msg
+
+    def dedup_key(self):
+        return (self.sev, self.path, self.line, self.col, self.msg)
+
+
+class Result:
+    """Parsed outcome of one build."""
+
+    def __init__(self):
+        self.items = []
+        self.status = None       # "SUCCESS" | "FAILURE" | "KILLED" | None
+        self.duration = 0.0
+        self.tests_summary = None
+        self.raw_tail = []       # last raw lines, for the 'raw' view
+
+    @property
+    def errors(self):
+        return [i for i in self.items if i.sev == "ERROR"]
+
+    @property
+    def warnings(self):
+        return [i for i in self.items if i.sev == "WARNING"]
+
+
+class State:
+    """Shared state between the runner thread and the UI thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.job = "check"
+        self.offline = False
+        self.building = False
+        self.build_started = 0.0
+        self.last_activity = ""     # last raw maven line while building
+        self.result = Result()      # previous result stays visible while building
+        self.dirty = True           # UI needs redraw
+        self.summary = False        # summary mode: one line per item
+        self.show_raw = False       # raw output view
+        self.help = False
+        self.scroll = 0
+        self.quit = False
+
+
+# ---------------------------------------------------------------- parsing
+
+
+def strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def parse_output(lines, cwd):
+    """Turn raw maven output lines into a sorted, deduplicated Result."""
+    res = Result()
+    seen = set()
+    loc_err, gen_err, loc_warn, gen_warn = [], [], [], []
+
+    for raw in lines:
+        line = strip_ansi(raw).rstrip("\n")
+
+        m = LOC_RE.match(line)
+        if m:
+            sev, path, ln, col, msg = m.groups()
+            try:
+                path = os.path.relpath(path, cwd)
+            except ValueError:
+                pass
+            it = Item(sev, path, int(ln), int(col) if col else None, msg.strip())
+            if it.dedup_key() in seen:
+                continue
+            seen.add(it.dedup_key())
+            (loc_err if sev == "ERROR" else loc_warn).append(it)
+            continue
+
+        m = GEN_RE.match(line)
+        if m:
+            sev, msg = m.groups()
+            msg = msg.strip()
+            if not msg or msg.startswith(NOISE_PREFIXES):
+                continue
+            if TESTS_RE.search(msg):
+                res.tests_summary = msg
+                continue
+            msg = re.sub(r"\s*->\s*\[Help \d+\]\s*$", "", msg)
+            if not msg:
+                continue
+            it = Item(sev, None, None, None, msg)
+            if it.dedup_key() in seen:
+                continue
+            seen.add(it.dedup_key())
+            (gen_err if sev == "ERROR" else gen_warn).append(it)
+            continue
+
+        if "BUILD SUCCESS" in line:
+            res.status = "SUCCESS"
+        elif "BUILD FAILURE" in line:
+            res.status = "FAILURE"
+        m = TESTS_RE.search(line)
+        if m and res.tests_summary is None:
+            res.tests_summary = m.group(0)
+
+    # bacon's key idea: errors first, so the top of the screen matters most
+    res.items = loc_err + gen_err + loc_warn + gen_warn
+    res.raw_tail = [strip_ansi(l).rstrip("\n") for l in lines[-400:]]
+    return res
+
+
+# ---------------------------------------------------------------- watcher
+
+
+IGNORED_DIRS = {".git", "target", "node_modules", ".idea", ".vscode", "build"}
+WATCH_EXTS = (".java", ".xml", ".properties", ".yaml", ".yml", ".kt", ".groovy")
+
+
+def find_watch_roots(cwd, extra):
+    """Watch every src/ dir and pom.xml up to 3 levels deep (multi-module)."""
+    roots = set()
+    for base, dirs, files in os.walk(cwd):
+        depth = os.path.relpath(base, cwd).count(os.sep)
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and depth < 3]
+        if "pom.xml" in files:
+            roots.add(os.path.join(base, "pom.xml"))
+        if os.path.basename(base) == "src":
+            roots.add(base)
+            dirs[:] = []  # do not descend further; snapshot() walks it
+    for e in extra:
+        p = os.path.join(cwd, e)
+        if os.path.exists(p):
+            roots.add(p)
+    return sorted(roots)
+
+
+def snapshot(roots):
+    snap = {}
+    for root in roots:
+        if os.path.isfile(root):
+            try:
+                snap[root] = os.stat(root).st_mtime_ns
+            except OSError:
+                pass
+            continue
+        for base, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for f in files:
+                if f.endswith(WATCH_EXTS):
+                    p = os.path.join(base, f)
+                    try:
+                        snap[p] = os.stat(p).st_mtime_ns
+                    except OSError:
+                        pass
+    return snap
+
+
+def watcher_thread(state, trigger, roots, interval):
+    prev = snapshot(roots)
+    while not state.quit:
+        time.sleep(interval)
+        cur = snapshot(roots)
+        if cur != prev:
+            prev = cur
+            trigger.set()
+
+
+# ---------------------------------------------------------------- runner
+
+
+def pick_mvn(explicit, cwd):
+    if explicit:
+        return explicit
+    if shutil.which("mvnd"):
+        return "mvnd"
+    mvnw = os.path.join(cwd, "mvnw")
+    if os.path.isfile(mvnw) and os.access(mvnw, os.X_OK):
+        return mvnw
+    return "mvn"
+
+
+def build_cmd(mvn, job_conf, offline, extra_args):
+    cmd = [mvn, "-B", "-Dstyle.color=never"]
+    if offline:
+        cmd.append("-o")
+    cmd += extra_args
+    cmd += job_conf["goals"]
+    return cmd
+
+
+def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
+    while not state.quit:
+        if not trigger.wait(timeout=0.2):
+            continue
+        time.sleep(0.15)          # debounce a burst of saves
+        trigger.clear()
+        if state.quit:
+            return
+
+        with state.lock:
+            job_conf = jobs[state.job]
+            cmd = build_cmd(mvn, job_conf, state.offline, extra_args)
+            state.building = True
+            state.build_started = time.time()
+            state.last_activity = " ".join(cmd)
+            state.dirty = True
+
+        lines = []
+        killed = False
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", start_new_session=True,
+            )
+        except FileNotFoundError:
+            with state.lock:
+                r = Result()
+                r.status = "FAILURE"
+                r.items = [Item("ERROR", None, None, None,
+                                f"command not found: {cmd[0]} "
+                                f"(install maven/mvnd or pass --mvn PATH)")]
+                state.result = r
+                state.building = False
+                state.dirty = True
+            continue
+
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            if state.quit or trigger.is_set():
+                # a newer change arrived: cancel this build, like watchexec -r
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+                proc.wait()
+                killed = True
+                break
+            if sel.select(timeout=0.2):
+                line = proc.stdout.readline()
+                if line == "":
+                    break
+                lines.append(line)
+                with state.lock:
+                    state.last_activity = strip_ansi(line).strip()[:200]
+                    state.dirty = True
+        sel.close()
+        rc = proc.wait()
+
+        if state.quit:
+            return
+        if killed:
+            with state.lock:
+                state.building = False
+                state.dirty = True
+            continue  # trigger is still set -> loop reruns immediately
+
+        res = parse_output(lines, cwd)
+        if res.status is None:
+            res.status = "SUCCESS" if rc == 0 else "FAILURE"
+        res.duration = time.time() - state.build_started
+
+        with state.lock:
+            state.result = res
+            state.building = False
+            state.scroll = 0
+            state.dirty = True
+
+
+# ---------------------------------------------------------------- rendering
+
+
+def visible_len(s):
+    return len(strip_ansi(s))
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def vtrunc(s, width):
+    """Truncate to `width` visible columns, keeping ANSI sequences intact."""
+    out, vis, i = [], 0, 0
+    while i < len(s):
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        if vis >= width:
+            break
+        out.append(s[i])
+        vis += 1
+        i += 1
+    return "".join(out) + (RESET if vis >= width else "")
+
+
+def wrap(text, width, indent):
+    """Simple word wrap that keeps ANSI codes intact enough for our use."""
+    out, cur = [], ""
+    for word in text.split(" "):
+        if cur and visible_len(cur) + 1 + visible_len(word) > width:
+            out.append(cur)
+            cur = indent + word
+        else:
+            cur = word if not cur else cur + " " + word
+    if cur:
+        out.append(cur)
+    return out
+
+
+def render(state, jobs, mvn_name):
+    cols, rows = shutil.get_terminal_size()
+    body_h = rows - 3  # header + status + footer
+
+    with state.lock:
+        res = state.result
+        building = state.building
+        elapsed = time.time() - state.build_started if building else res.duration
+        job = state.job
+        offline = state.offline
+        summary = state.summary
+        show_raw = state.show_raw
+        show_help = state.help
+        scroll = state.scroll
+        activity = state.last_activity
+        tests = res.tests_summary
+        status = res.status
+
+    ne, nw = len(res.errors), len(res.warnings)
+
+    # ---- header
+    if building:
+        spin = SPINNER[int(time.time() * 8) % len(SPINNER)]
+        stat = f"{MAGENTA}{spin} building {elapsed:4.1f}s{RESET}"
+    elif status == "SUCCESS" and ne == 0:
+        stat = f"{GREEN}{BOLD}pass{RESET}"
+    else:
+        stat = f"{RED}{BOLD}fail{RESET}"
+    counts = f"{RED}{ne} errors{RESET}, {YELLOW}{nw} warnings{RESET}"
+    off = f" {DIM}[offline]{RESET}" if offline else ""
+    header = (f" {BOLD}jbacon{RESET} {DIM}{VERSION}{RESET}  "
+              f"job:{CYAN}{job}{RESET}  {DIM}{mvn_name}{RESET}{off}  "
+              f"{stat}  {counts}")
+
+    # ---- body lines
+    lines = []
+    if show_help:
+        lines.append(f"{BOLD}jobs{RESET}")
+        for name, conf in jobs.items():
+            lines.append(f"  {CYAN}{conf['key']}{RESET}  {name:<10} "
+                         f"{DIM}{' '.join(conf['goals'])}  # {conf.get('desc','')}{RESET}")
+        lines.append("")
+        lines.append(f"{BOLD}keys{RESET}")
+        lines.append(f"  {CYAN}r{RESET} rerun   {CYAN}o{RESET} offline on/off   "
+                     f"{CYAN}s{RESET} summary   {CYAN}w{RESET} raw output   "
+                     f"{CYAN}j/k g/G{RESET} scroll   {CYAN}q{RESET} quit")
+    elif show_raw:
+        lines = res.raw_tail or [f"{DIM}(no output yet){RESET}"]
+    elif not res.items:
+        if building and not res.raw_tail and status is None:
+            lines.append(f"{DIM}first build running...{RESET}")
+        elif status == "SUCCESS":
+            lines.append(f"{GREEN}All clear.{RESET}")
+            if tests:
+                lines.append(f"{DIM}{tests}{RESET}")
+        else:
+            lines.append(f"{DIM}(no diagnostics parsed - press w for raw output){RESET}")
+    else:
+        for it in res.items:
+            color = RED if it.sev == "ERROR" else YELLOW
+            tag = f"{color}{BOLD}{'E' if it.sev == 'ERROR' else 'W'}{RESET}"
+            if it.path:
+                loc = f"{CYAN}{it.path}{RESET}{DIM}:{it.line}" \
+                      + (f":{it.col}{RESET}" if it.col else f"{RESET}")
+                lines.append(f"{tag} {loc}")
+                if summary:
+                    lines.append(f"   {DIM}{it.msg[:cols-4]}{RESET}")
+                else:
+                    lines.extend("   " + w for w in wrap(it.msg, cols - 4, ""))
+            else:
+                first, *rest = wrap(f"{tag} {it.msg}", cols - 1, "  ")
+                lines.append(first)
+                if not summary:
+                    lines.extend(rest)
+        if tests:
+            lines.append("")
+            lines.append(f"{DIM}{tests}{RESET}")
+
+    # ---- scroll
+    max_scroll = max(0, len(lines) - body_h)
+    scroll = min(scroll, max_scroll)
+    with state.lock:
+        state.scroll = scroll
+    view = lines[scroll:scroll + body_h]
+
+    # ---- status + footer
+    if building:
+        stline = f" {DIM}{activity[:cols-2]}{RESET}"
+    else:
+        emoji = GREEN if status == "SUCCESS" else RED
+        stline = (f" {emoji}BUILD {status or '?'}{RESET} {DIM}in {elapsed:.1f}s"
+                  f"   ({scroll}/{max_scroll} scroll){RESET}" if status else "")
+    jobkeys = "  ".join(f"{CYAN}{c['key']}{RESET}:{n}" for n, c in jobs.items())
+    footer = (f"{INVERT} {jobkeys}  {CYAN}r{RESET}:rerun {CYAN}o{RESET}:offline "
+              f"{CYAN}s{RESET}:summary {CYAN}w{RESET}:raw {CYAN}h{RESET}:help "
+              f"{CYAN}q{RESET}:quit {RESET}")
+
+    out = [HOME]
+    out.append(vtrunc(header, cols - 1) + CLEAR_EOL + "\n")
+    for l in view:
+        out.append(vtrunc(l, cols - 1) + CLEAR_EOL + "\n")
+    for _ in range(body_h - len(view)):
+        out.append(CLEAR_EOL + "\n")
+    out.append(vtrunc(stline, cols - 1) + CLEAR_EOL + "\n")
+    out.append(vtrunc(footer, cols - 1) + CLEAR_EOL)
+    out.append(CLEAR_BELOW)
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- input
+
+
+def handle_keys(state, trigger, jobs, data):
+    key_to_job = {c["key"]: n for n, c in jobs.items()}
+    i = 0
+    while i < len(data):
+        ch = data[i]
+        if ch == "\x1b" and data[i:i + 3] in ("\x1b[A", "\x1b[B"):
+            ch = "k" if data[i + 2] == "A" else "j"
+            i += 3
+        else:
+            i += 1
+        with state.lock:
+            if ch == "q" or ch == "\x03":
+                state.quit = True
+            elif ch in key_to_job:
+                state.job = key_to_job[ch]
+                trigger.set()
+            elif ch == "r":
+                trigger.set()
+            elif ch == "o":
+                state.offline = not state.offline
+                trigger.set()
+            elif ch == "s":
+                state.summary = not state.summary
+            elif ch == "w":
+                state.show_raw = not state.show_raw
+            elif ch == "h":
+                state.help = not state.help
+            elif ch == "j":
+                state.scroll += 1
+            elif ch == "k":
+                state.scroll = max(0, state.scroll - 1)
+            elif ch == "g":
+                state.scroll = 0
+            elif ch == "G":
+                state.scroll = 10 ** 9
+            state.dirty = True
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config(cwd, args):
+    jobs = {k: dict(v) for k, v in DEFAULT_JOBS.items()}
+    default_job = "check"
+    extra_args = []
+    watch_extra = []
+    offline = args.offline
+    interval = 0.7
+
+    path = os.path.join(cwd, "jbacon.toml")
+    if os.path.isfile(path) and tomllib:
+        with open(path, "rb") as f:
+            conf = tomllib.load(f)
+        default_job = conf.get("default_job", default_job)
+        extra_args = list(conf.get("extra_args", []))
+        watch_extra = list(conf.get("watch", []))
+        offline = conf.get("offline", offline)
+        interval = float(conf.get("poll_interval", interval))
+        for name, jc in conf.get("jobs", {}).items():
+            goals = jc.get("goals")
+            if not goals:
+                continue
+            key = jc.get("key", jobs.get(name, {}).get("key", ""))
+            if key in RESERVED_KEYS:
+                print(f"jbacon.toml: key '{key}' for job '{name}' is reserved", file=sys.stderr)
+                sys.exit(2)
+            jobs[name] = {"key": key, "goals": list(goals), "desc": jc.get("desc", "")}
+
+    if args.job:
+        default_job = args.job
+    if default_job not in jobs:
+        print(f"unknown job: {default_job} (available: {', '.join(jobs)})", file=sys.stderr)
+        sys.exit(2)
+    return jobs, default_job, extra_args, watch_extra, offline, interval
+
+
+# ---------------------------------------------------------------- once mode
+
+
+def run_once(state, jobs, mvn, extra_args, cwd):
+    conf = jobs[state.job]
+    cmd = build_cmd(mvn, conf, state.offline, extra_args)
+    print(f"{DIM}$ {' '.join(cmd)}{RESET}", flush=True)
+    t0 = time.time()
+    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, errors="replace")
+    res = parse_output(proc.stdout.splitlines(keepends=True), cwd)
+    if res.status is None:
+        res.status = "SUCCESS" if proc.returncode == 0 else "FAILURE"
+    for it in res.items:
+        color = RED if it.sev == "ERROR" else YELLOW
+        if it.path:
+            loc = f"{CYAN}{it.path}{RESET}:{it.line}" + (f":{it.col}" if it.col else "")
+            print(f"{color}{BOLD}{it.sev}{RESET} {loc}\n   {it.msg}")
+        else:
+            print(f"{color}{BOLD}{it.sev}{RESET} {it.msg}")
+    if res.tests_summary:
+        print(f"{DIM}{res.tests_summary}{RESET}")
+    ok = res.status == "SUCCESS"
+    col = GREEN if ok else RED
+    print(f"{col}{BOLD}BUILD {res.status}{RESET} in {time.time()-t0:.1f}s "
+          f"({len(res.errors)} errors, {len(res.warnings)} warnings)")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- main
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="jbacon",
+                                 description="bacon-like background checker for Maven")
+    ap.add_argument("--job", help="job to start with (default from jbacon.toml or 'check')")
+    ap.add_argument("--mvn", help="maven executable (default: mvnd > ./mvnw > mvn)")
+    ap.add_argument("--offline", action="store_true", help="pass -o to maven")
+    ap.add_argument("--once", action="store_true", help="run once, print report, exit (for CI)")
+    ap.add_argument("--dir", default=".", help="project directory (default: .)")
+    ap.add_argument("--version", action="version", version=f"jbacon {VERSION}")
+    args = ap.parse_args()
+
+    cwd = os.path.abspath(args.dir)
+    if not os.path.isfile(os.path.join(cwd, "pom.xml")):
+        print(f"no pom.xml in {cwd} - is this a Maven project?", file=sys.stderr)
+        sys.exit(2)
+
+    jobs, default_job, extra_args, watch_extra, offline, interval = load_config(cwd, args)
+    mvn = pick_mvn(args.mvn, cwd)
+
+    state = State()
+    state.job = default_job
+    state.offline = offline
+
+    if args.once:
+        sys.exit(run_once(state, jobs, mvn, extra_args, cwd))
+
+    trigger = threading.Event()
+    trigger.set()  # build immediately on startup
+
+    roots = find_watch_roots(cwd, watch_extra)
+    threading.Thread(target=watcher_thread, args=(state, trigger, roots, interval),
+                     daemon=True).start()
+    threading.Thread(target=runner_thread, args=(state, trigger, jobs, mvn, extra_args, cwd),
+                     daemon=True).start()
+
+    # terminal setup
+    is_tty = sys.stdin.isatty()
+    old_attrs = None
+    if is_tty:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    sys.stdout.write(ALT_ON + CURSOR_HIDE)
+
+    try:
+        while not state.quit:
+            if is_tty:
+                import select
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if r:
+                    data = os.read(sys.stdin.fileno(), 64).decode(errors="ignore")
+                    handle_keys(state, trigger, jobs, data)
+            else:
+                time.sleep(0.1)
+            with state.lock:
+                need = state.dirty or state.building
+                state.dirty = False
+            if need:
+                render(state, jobs, os.path.basename(mvn))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        state.quit = True
+        trigger.set()
+        sys.stdout.write(CURSOR_SHOW + ALT_OFF)
+        sys.stdout.flush()
+        if old_attrs:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+
+
+if __name__ == "__main__":
+    main()

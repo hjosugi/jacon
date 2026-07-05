@@ -1,0 +1,46 @@
+# jbacon.toml - place this in your Maven project root (same dir as pom.xml).
+# Everything here is optional. Without this file, jbacon uses built-in defaults.
+
+# Job started on launch.
+default_job = "check"
+
+# Pass -o (offline) to every maven command. Toggle at runtime with the 'o' key.
+offline = false
+
+# Extra args appended to every maven command.
+# -T1C = one thread per core. Remove it if your build is not parallel-safe.
+extra_args = ["-T1C"]
+
+# Extra paths to watch, relative to the project root.
+# src/ dirs and pom.xml files (up to 3 levels deep) are watched automatically.
+watch = []
+
+# File watch poll interval in seconds.
+poll_interval = 0.7
+
+# ---- jobs -------------------------------------------------------------
+# Built-in jobs (can be overridden):
+#   check   (c)  test-compile
+#   test    (t)  test
+#   verify  (v)  verify
+#   package (p)  package -DskipTests
+#
+# Reserved keys you cannot use for jobs: r o q s h w j k g G
+
+# Example: quick single-module compile in a multi-module repo.
+# [jobs.core]
+# key = "1"
+# goals = ["-pl", "core", "-am", "test-compile"]
+# desc = "compile core module only"
+
+# Example: run Error Prone via a maven profile (see README Layer 3).
+# [jobs.errorprone]
+# key = "e"
+# goals = ["clean", "test-compile", "-Perrorprone"]
+# desc = "compile with Error Prone checks"
+
+# Example: single test class while debugging.
+# [jobs.focus]
+# key = "f"
+# goals = ["test", "-Dtest=CalcTest"]
+# desc = "run only CalcTest"
