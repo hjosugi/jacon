@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  parser:
+    name: parser unit tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: syntax check
+        run: python -c "import ast; ast.parse(open('jbacon').read())"
+      - name: parser unit tests
+        run: python tests/parser_test.py
+
+  tui:
+    name: TUI integration test
+    runs-on: ubuntu-latest
+    # End-to-end test: needs a JDK + Maven and downloads the demo's deps.
+    # Allowed to fail so a transient Maven/network hiccup never blocks a PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: TUI integration test
+        run: python tests/tui_test.py

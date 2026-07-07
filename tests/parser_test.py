@@ -35,6 +35,14 @@ SUREFIRE = """\
 [INFO] BUILD FAILURE
 """
 
+# kotlin-maven-plugin uses a paren location style: file.kt: (line, col) message
+KOTLIN = """\
+[INFO] --- kotlin-maven-plugin:2.0.0:compile (compile) @ demo ---
+[WARNING] /work/src/main/kotlin/com/example/App.kt: (7, 5) parameter 'x' is never used
+[ERROR] /work/src/main/kotlin/com/example/App.kt: (12, 9) unresolved reference: foo
+[INFO] BUILD FAILURE
+"""
+
 
 def check(cond, msg):
     if not cond:
@@ -70,6 +78,17 @@ def main():
     check(any("expected: <99>" in i.msg for i in r2.items),
           "assertion message not captured")
     check(r2.status == "FAILURE", "surefire failure status")
+
+    # Kotlin paren-style location must be parsed into path/line/col, not fall
+    # through to an unlocated general error.
+    r3 = mod.parse_output(KOTLIN.splitlines(keepends=True), "/work")
+    check(len(r3.errors) == 1 and len(r3.warnings) == 1,
+          f"kotlin: expected 1 error + 1 warning, got "
+          f"{len(r3.errors)}/{len(r3.warnings)}")
+    ke = r3.errors[0]
+    check(ke.path == "src/main/kotlin/com/example/App.kt", f"kotlin bad path: {ke.path}")
+    check((ke.line, ke.col) == (12, 9), f"kotlin line/col not parsed: {ke.line},{ke.col}")
+    check("unresolved reference" in ke.msg, "kotlin message not captured")
 
     print("parser unit tests: all checks passed")
 
