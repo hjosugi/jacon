@@ -20,6 +20,10 @@ jobs:
         run: python -c "import ast; ast.parse(open('jbacon').read())"
       - name: parser unit tests
         run: python tests/parser_test.py
+      - name: release script syntax
+        run: |
+          sh -n install.sh
+          sh -n scripts/build-native.sh
 
   tui:
     name: TUI integration test

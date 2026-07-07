@@ -1,6 +1,6 @@
 #!/usr/bin/env fish
-# Install jbacon to ~/.local/bin (fish shell).
-# Usage: fish install.fish
+# Install this checkout's Python script to ~/.local/bin (fish shell).
+# For native release binaries, use: curl -fsSL https://raw.githubusercontent.com/hjosugi/jacon/main/install.sh | sh
 
 set -l here (dirname (status filename))
 set -l dest ~/.local/bin

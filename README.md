@@ -37,19 +37,27 @@ E Failed to execute goal
 
 ## 必要なもの
 
-- Python 3.11+（tomllib 使用。設定ファイルを使わなければ 3.8+ でも動く）
 - `mvn` / `mvnd` / `./mvnw` のどれか
 - Linux / macOS のターミナル（Windows は WSL で）
+- native release binary を使う場合、Python は不要
+- ソースを直接コピーして使う場合、Python 3.11+（tomllib 使用。設定ファイルを使わなければ 3.8+ でも動く）
 
 ## インストール
 
 ```bash
-# fish (CachyOS など)
+# いちばん簡単: native 単体バイナリを ~/.local/bin/jbacon に入れる
+curl -fsSL https://raw.githubusercontent.com/hjosugi/jacon/main/install.sh | sh
+
+# ソース checkout から入れる場合: fish (CachyOS など)
 fish install.fish
 
 # または手動で
 cp jbacon ~/.local/bin/ && chmod +x ~/.local/bin/jbacon
 ```
+
+native release は Linux x86_64 / Linux aarch64 / macOS x86_64 / macOS arm64 を用意する。
+特定バージョンを入れる場合は `JBACON_VERSION=v0.2.0`、インストール先を変える場合は
+`JBACON_INSTALL_DIR=/path/to/bin` を指定する。
 
 高速化したい場合は mvnd を推奨:
 
@@ -144,7 +152,16 @@ python3 tests/parser_test.py   # パーサ単体テスト
 python3 tests/tui_test.py      # pty経由のTUI結合テスト (要 mvn + JDK)
 ```
 
-どちらも本zip作成時に全項目パス済み。
+parser test は CI で実行する。TUI 結合テストは `mvn` + JDK が入ったローカル環境で実行する。
+
+## リリース
+
+tag を push すると GitHub Actions が PyInstaller で native release asset を作成する。
+
+```bash
+git tag v0.2.0
+git push origin main v0.2.0
+```
 
 ## 制限
 
