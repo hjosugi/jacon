@@ -156,6 +156,3 @@ python3 tests/tui_test.py      # pty経由のTUI結合テスト (要 mvn + JDK)
 ## License
 
 0BSD. You can use, copy, modify, and distribute this project for almost any purpose.
-
-
-MIT
