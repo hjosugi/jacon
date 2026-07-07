@@ -4,14 +4,18 @@
 import importlib.util
 import os
 import sys
+from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_loader("jbacon", loader=None)
-mod = importlib.util.module_from_spec(spec)
-src = open(os.path.join(HERE, "..", "jbacon")).read()
-# Do not run main() when loading the script as a module.
-exec(compile(src.replace('if __name__ == "__main__":', 'if False:'), "jbacon", "exec"),
-     mod.__dict__)
+# Load the extensionless script as a module. Because __name__ is "jbacon" (not
+# "__main__"), the `if __name__ == "__main__": main()` guard does not fire.
+_loader = SourceFileLoader("jbacon", os.path.join(HERE, "..", "jbacon"))
+_spec = importlib.util.spec_from_loader("jbacon", _loader)
+mod = importlib.util.module_from_spec(_spec)
+# Register before exec so @dataclass can resolve its (string) annotations via
+# sys.modules["jbacon"] under `from __future__ import annotations`.
+sys.modules["jbacon"] = mod
+_loader.exec_module(mod)
 
 FIXTURE = """\
 [INFO] Scanning for projects...
