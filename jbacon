@@ -10,9 +10,12 @@
 #
 # Requires: Python 3.11+ (tomllib), Linux/macOS terminal. Uses mvnd if found.
 
+from __future__ import annotations  # PEP 604 hints (str | None) work on 3.8+
+
 import argparse
 import os
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -20,11 +23,18 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 try:
     import tomllib
 except ImportError:  # Python < 3.11
     tomllib = None
+
+try:
+    import termios
+    import tty
+except ImportError:  # non-Unix (jbacon targets Linux/macOS terminals)
+    termios = tty = None
 
 # ---------------------------------------------------------------- constants
 
@@ -39,6 +49,15 @@ GREEN = "\x1b[32m"
 CYAN = "\x1b[36m"
 MAGENTA = "\x1b[35m"
 INVERT = "\x1b[7m"
+
+# One CSI matcher, shared by strip_ansi() and vtrunc(). Matches a whole escape
+# sequence (color, cursor, erase, ...) so stripping is complete, not SGR-only.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+# Diagnostic severities. Kept as the exact Maven strings so parsing and the
+# --once report (which prints it.sev verbatim) stay unchanged.
+ERROR = "ERROR"
+WARNING = "WARNING"
 
 ALT_ON = "\x1b[?1049h"
 ALT_OFF = "\x1b[?1049l"
@@ -57,7 +76,7 @@ DEFAULT_JOBS = {
     "package": {"key": "p", "goals": ["package", "-DskipTests"], "desc": "package without tests"},
 }
 
-RESERVED_KEYS = set("roqswhjkgG")
+# RESERVED_KEYS is derived from the built-in key table; see KEY_ACTIONS below.
 
 # Maven compiler / plugin message with a source location:
 #   [ERROR] /abs/path/Foo.java:[12,5] ';' expected           (maven-compiler-plugin)
@@ -86,39 +105,39 @@ NOISE_PREFIXES = (
 # ---------------------------------------------------------------- model
 
 
+@dataclass(frozen=True)
 class Item:
-    """One diagnostic: an error or a warning, with or without a location."""
+    """One diagnostic: an error or a warning, with or without a location.
 
-    __slots__ = ("sev", "path", "line", "col", "msg")
+    Frozen so it is hashable: an Item can go straight into the dedup set,
+    no separate dedup_key() needed. (No slots=True, to keep Python 3.8/3.9
+    working; there are only a handful of diagnostics per build.)
+    """
 
-    def __init__(self, sev, path, line, col, msg):
-        self.sev = sev          # "ERROR" | "WARNING"
-        self.path = path        # relative path or None
-        self.line = line        # int or None
-        self.col = col          # int or None
-        self.msg = msg
-
-    def dedup_key(self):
-        return (self.sev, self.path, self.line, self.col, self.msg)
+    sev: str            # ERROR | WARNING
+    path: str | None    # relative path, or None for unlocated diagnostics
+    line: int | None
+    col: int | None
+    msg: str
 
 
+@dataclass
 class Result:
     """Parsed outcome of one build."""
 
-    def __init__(self):
-        self.items = []
-        self.status = None       # "SUCCESS" | "FAILURE" | "KILLED" | None
-        self.duration = 0.0
-        self.tests_summary = None
-        self.raw_tail = []       # last raw lines, for the 'raw' view
+    items: list[Item] = field(default_factory=list)
+    status: str | None = None       # "SUCCESS" | "FAILURE" | None
+    duration: float = 0.0
+    tests_summary: str | None = None
+    raw_tail: list[str] = field(default_factory=list)  # last raw lines, 'raw' view
 
     @property
-    def errors(self):
-        return [i for i in self.items if i.sev == "ERROR"]
+    def errors(self) -> list[Item]:
+        return [i for i in self.items if i.sev == ERROR]
 
     @property
-    def warnings(self):
-        return [i for i in self.items if i.sev == "WARNING"]
+    def warnings(self) -> list[Item]:
+        return [i for i in self.items if i.sev == WARNING]
 
 
 class State:
@@ -143,11 +162,11 @@ class State:
 # ---------------------------------------------------------------- parsing
 
 
-def strip_ansi(s):
-    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
 
 
-def parse_output(lines, cwd):
+def parse_output(lines: list[str], cwd: str) -> Result:
     """Turn raw maven output lines into a sorted, deduplicated Result."""
     res = Result()
     seen = set()
@@ -166,10 +185,10 @@ def parse_output(lines, cwd):
             except ValueError:
                 pass
             it = Item(sev, path, int(ln), int(col) if col else None, msg.strip())
-            if it.dedup_key() in seen:
+            if it in seen:
                 continue
-            seen.add(it.dedup_key())
-            (loc_err if sev == "ERROR" else loc_warn).append(it)
+            seen.add(it)
+            (loc_err if sev == ERROR else loc_warn).append(it)
             continue
 
         m = GEN_RE.match(line)
@@ -185,10 +204,10 @@ def parse_output(lines, cwd):
             if not msg:
                 continue
             it = Item(sev, None, None, None, msg)
-            if it.dedup_key() in seen:
+            if it in seen:
                 continue
-            seen.add(it.dedup_key())
-            (gen_err if sev == "ERROR" else gen_warn).append(it)
+            seen.add(it)
+            (gen_err if sev == ERROR else gen_warn).append(it)
             continue
 
         if "BUILD SUCCESS" in line:
@@ -327,7 +346,7 @@ def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
             with state.lock:
                 r = Result()
                 r.status = "FAILURE"
-                r.items = [Item("ERROR", None, None, None,
+                r.items = [Item(ERROR, None, None, None,
                                 f"command not found: {cmd[0]} "
                                 f"(install maven/mvnd or pass --mvn PATH)")]
                 state.result = r
@@ -392,9 +411,6 @@ def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
 
 def visible_len(s):
     return len(strip_ansi(s))
-
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
 def vtrunc(s, width):
@@ -487,8 +503,8 @@ def render(state, jobs, mvn_name):
             lines.append(f"{DIM}(no diagnostics parsed - press w for raw output){RESET}")
     else:
         for it in res.items:
-            color = RED if it.sev == "ERROR" else YELLOW
-            tag = f"{color}{BOLD}{'E' if it.sev == 'ERROR' else 'W'}{RESET}"
+            color = RED if it.sev == ERROR else YELLOW
+            tag = f"{color}{BOLD}{'E' if it.sev == ERROR else 'W'}{RESET}"
             if it.path:
                 loc = f"{CYAN}{it.path}{RESET}{DIM}:{it.line}" \
                       + (f":{it.col}{RESET}" if it.col else f"{RESET}")
@@ -541,6 +557,62 @@ def render(state, jobs, mvn_name):
 # ---------------------------------------------------------------- input
 
 
+# Built-in key actions. Each mutates state (already under state.lock in
+# handle_keys) and may poke the trigger to force a rebuild.
+def _act_rerun(state, trigger):
+    trigger.set()
+
+
+def _act_offline(state, trigger):
+    state.offline = not state.offline
+    trigger.set()
+
+
+def _act_summary(state, trigger):
+    state.summary = not state.summary
+
+
+def _act_raw(state, trigger):
+    state.show_raw = not state.show_raw
+
+
+def _act_help(state, trigger):
+    state.help = not state.help
+
+
+def _act_scroll_down(state, trigger):
+    state.scroll += 1
+
+
+def _act_scroll_up(state, trigger):
+    state.scroll = max(0, state.scroll - 1)
+
+
+def _act_scroll_top(state, trigger):
+    state.scroll = 0
+
+
+def _act_scroll_bottom(state, trigger):
+    state.scroll = 10 ** 9
+
+
+KEY_ACTIONS = {
+    "r": _act_rerun,
+    "o": _act_offline,
+    "s": _act_summary,
+    "w": _act_raw,
+    "h": _act_help,
+    "j": _act_scroll_down,
+    "k": _act_scroll_up,
+    "g": _act_scroll_top,
+    "G": _act_scroll_bottom,
+}
+
+# Keys a jbacon.toml job may not claim: every built-in action plus quit. Derived
+# from KEY_ACTIONS so the UI and config validation can never drift apart.
+RESERVED_KEYS = frozenset(KEY_ACTIONS) | {"q"}
+
+
 def handle_keys(state, trigger, jobs, data):
     key_to_job = {c["key"]: n for n, c in jobs.items()}
     i = 0
@@ -557,25 +629,8 @@ def handle_keys(state, trigger, jobs, data):
             elif ch in key_to_job:
                 state.job = key_to_job[ch]
                 trigger.set()
-            elif ch == "r":
-                trigger.set()
-            elif ch == "o":
-                state.offline = not state.offline
-                trigger.set()
-            elif ch == "s":
-                state.summary = not state.summary
-            elif ch == "w":
-                state.show_raw = not state.show_raw
-            elif ch == "h":
-                state.help = not state.help
-            elif ch == "j":
-                state.scroll += 1
-            elif ch == "k":
-                state.scroll = max(0, state.scroll - 1)
-            elif ch == "g":
-                state.scroll = 0
-            elif ch == "G":
-                state.scroll = 10 ** 9
+            elif ch in KEY_ACTIONS:
+                KEY_ACTIONS[ch](state, trigger)
             state.dirty = True
 
 
@@ -667,7 +722,7 @@ def run_once(state, jobs, mvn, extra_args, cwd):
     if res.status is None:
         res.status = "SUCCESS" if proc.returncode == 0 else "FAILURE"
     for it in res.items:
-        color = RED if it.sev == "ERROR" else YELLOW
+        color = RED if it.sev == ERROR else YELLOW
         if it.path:
             loc = f"{CYAN}{it.path}{RESET}:{it.line}" + (f":{it.col}" if it.col else "")
             print(f"{color}{BOLD}{it.sev}{RESET} {loc}\n   {it.msg}")
@@ -719,12 +774,10 @@ def main():
     threading.Thread(target=runner_thread, args=(state, trigger, jobs, mvn, extra_args, cwd),
                      daemon=True).start()
 
-    # terminal setup
-    is_tty = sys.stdin.isatty()
+    # terminal setup (termios is None on non-Unix -> run without raw input)
+    is_tty = sys.stdin.isatty() and termios is not None
     old_attrs = None
     if is_tty:
-        import termios
-        import tty
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         tty.setcbreak(fd)
@@ -733,7 +786,6 @@ def main():
     try:
         while not state.quit:
             if is_tty:
-                import select
                 r, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if r:
                     data = os.read(sys.stdin.fileno(), 64).decode(errors="ignore")
@@ -753,7 +805,6 @@ def main():
         sys.stdout.write(CURSOR_SHOW + ALT_OFF)
         sys.stdout.flush()
         if old_attrs:
-            import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
 
 
