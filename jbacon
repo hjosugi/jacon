@@ -28,7 +28,7 @@ except ImportError:  # Python < 3.11
 
 # ---------------------------------------------------------------- constants
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
@@ -60,8 +60,13 @@ DEFAULT_JOBS = {
 RESERVED_KEYS = set("roqswhjkgG")
 
 # Maven compiler / plugin message with a source location:
-#   [ERROR] /abs/path/Foo.java:[12,5] ';' expected
-LOC_RE = re.compile(r"^\[(ERROR|WARNING)\]\s+(.+?\.java):\[(\d+)(?:,(\d+))?\]\s*(.*)$")
+#   [ERROR] /abs/path/Foo.java:[12,5] ';' expected           (maven-compiler-plugin)
+#   [ERROR] /abs/path/Foo.kt: (12, 5) unresolved reference    (kotlin-maven-plugin)
+# The location groups (path, line, col) are shared; only the bracket style differs.
+LOC_RE = re.compile(
+    r"^\[(ERROR|WARNING)\]\s+(.+?\.(?:java|kt|kts|groovy)):"
+    r"(?:\[(\d+)(?:,(\d+))?\]|\s*\((\d+)(?:,\s*(\d+))?\))\s*(.*)$"
+)
 # Any other [ERROR] / [WARNING] line:
 GEN_RE = re.compile(r"^\[(ERROR|WARNING)\]\s?(.*)$")
 TESTS_RE = re.compile(r"Tests run:\s*\d+.*")
@@ -153,7 +158,9 @@ def parse_output(lines, cwd):
 
         m = LOC_RE.match(line)
         if m:
-            sev, path, ln, col, msg = m.groups()
+            sev, path, ln_b, col_b, ln_p, col_p, msg = m.groups()
+            ln = ln_b or ln_p           # bracket style [l,c] or paren style (l, c)
+            col = col_b or col_p
             try:
                 path = os.path.relpath(path, cwd)
             except ValueError:
@@ -244,10 +251,20 @@ def snapshot(roots):
     return snap
 
 
-def watcher_thread(state, trigger, roots, interval):
+def watcher_thread(state, trigger, cwd, watch_extra, interval):
+    roots = find_watch_roots(cwd, watch_extra)
     prev = snapshot(roots)
+    # Re-discover roots roughly every 10s so a new module / src dir added during
+    # a long resident session is picked up without a restart. The walk is cheap:
+    # depth-limited to 3 levels and prunes target/ .git/ etc.
+    rescan_every = max(1, round(10.0 / interval))
+    ticks = 0
     while not state.quit:
         time.sleep(interval)
+        ticks += 1
+        if ticks >= rescan_every:
+            ticks = 0
+            roots = find_watch_roots(cwd, watch_extra)
         cur = snapshot(roots)
         if cur != prev:
             prev = cur
@@ -297,10 +314,14 @@ def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
         lines = []
         killed = False
         try:
+            # Binary mode: we drain the raw fd ourselves (see the read loop below)
+            # instead of using a buffered text readline(), so a burst of output is
+            # consumed in full on each wakeup and cancellation is never blocked on
+            # a partial, newline-less line.
             proc = subprocess.Popen(
                 cmd, cwd=cwd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, errors="replace", start_new_session=True,
+                start_new_session=True,
             )
         except FileNotFoundError:
             with state.lock:
@@ -314,8 +335,10 @@ def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
                 state.dirty = True
             continue
 
+        fd = proc.stdout.fileno()
         sel = selectors.DefaultSelector()
-        sel.register(proc.stdout, selectors.EVENT_READ)
+        sel.register(fd, selectors.EVENT_READ)
+        buf = b""
         while True:
             if state.quit or trigger.is_set():
                 # a newer change arrived: cancel this build, like watchexec -r
@@ -327,13 +350,20 @@ def runner_thread(state, trigger, jobs, mvn, extra_args, cwd):
                 killed = True
                 break
             if sel.select(timeout=0.2):
-                line = proc.stdout.readline()
-                if line == "":
-                    break
-                lines.append(line)
-                with state.lock:
-                    state.last_activity = strip_ansi(line).strip()[:200]
-                    state.dirty = True
+                chunk = os.read(fd, 65536)  # ready + blocking fd -> returns now
+                if not chunk:
+                    break  # EOF
+                buf += chunk
+                *complete, buf = buf.split(b"\n")
+                if complete:
+                    for raw in complete:
+                        lines.append(raw.decode(errors="replace") + "\n")
+                    with state.lock:
+                        state.last_activity = \
+                            strip_ansi(complete[-1].decode(errors="replace")).strip()[:200]
+                        state.dirty = True
+        if buf:  # trailing line with no final newline
+            lines.append(buf.decode(errors="replace"))
         sel.close()
         rc = proc.wait()
 
@@ -400,7 +430,7 @@ def wrap(text, width, indent):
 
 def render(state, jobs, mvn_name):
     cols, rows = shutil.get_terminal_size()
-    body_h = rows - 3  # header + status + footer
+    body_h = max(0, rows - 3)  # header + status + footer; never negative on tiny panes
 
     with state.lock:
         res = state.result
@@ -552,6 +582,17 @@ def handle_keys(state, trigger, jobs, data):
 # ---------------------------------------------------------------- config
 
 
+def _cfg_error(msg):
+    print(f"jbacon.toml: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _as_str_list(val, field):
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        _cfg_error(f"'{field}' must be a list of strings")
+    return list(val)
+
+
 def load_config(cwd, args):
     jobs = {k: dict(v) for k, v in DEFAULT_JOBS.items()}
     default_job = "check"
@@ -561,23 +602,48 @@ def load_config(cwd, args):
     interval = 0.7
 
     path = os.path.join(cwd, "jbacon.toml")
-    if os.path.isfile(path) and tomllib:
-        with open(path, "rb") as f:
-            conf = tomllib.load(f)
-        default_job = conf.get("default_job", default_job)
-        extra_args = list(conf.get("extra_args", []))
-        watch_extra = list(conf.get("watch", []))
-        offline = conf.get("offline", offline)
-        interval = float(conf.get("poll_interval", interval))
-        for name, jc in conf.get("jobs", {}).items():
-            goals = jc.get("goals")
-            if not goals:
-                continue
-            key = jc.get("key", jobs.get(name, {}).get("key", ""))
-            if key in RESERVED_KEYS:
-                print(f"jbacon.toml: key '{key}' for job '{name}' is reserved", file=sys.stderr)
-                sys.exit(2)
-            jobs[name] = {"key": key, "goals": list(goals), "desc": jc.get("desc", "")}
+    if os.path.isfile(path):
+        if tomllib is None:
+            # Silently defaulting would hide the user's whole config; warn loudly.
+            print("jbacon: jbacon.toml found but ignored "
+                  "(parsing it needs Python 3.11+ for tomllib)", file=sys.stderr)
+        else:
+            with open(path, "rb") as f:
+                conf = tomllib.load(f)
+            default_job = conf.get("default_job", default_job)
+            extra_args = _as_str_list(conf.get("extra_args", []), "extra_args")
+            watch_extra = _as_str_list(conf.get("watch", []), "watch")
+            offline = conf.get("offline", offline)
+            iv = conf.get("poll_interval", interval)
+            if not isinstance(iv, (int, float)) or isinstance(iv, bool) or iv <= 0:
+                _cfg_error("'poll_interval' must be a positive number")
+            interval = float(iv)
+            for name, jc in conf.get("jobs", {}).items():
+                goals = jc.get("goals")
+                if not goals:
+                    continue
+                goals = _as_str_list(goals, f"jobs.{name}.goals")
+                key = jc.get("key", jobs.get(name, {}).get("key", ""))
+                if key in RESERVED_KEYS:
+                    _cfg_error(f"key '{key}' for job '{name}' is reserved")
+                if key == "":
+                    print(f"jbacon: job '{name}' has no key; select it with "
+                          f"--job {name}", file=sys.stderr)
+                elif len(key) != 1:
+                    _cfg_error(f"key '{key}' for job '{name}' must be a single "
+                               f"character")
+                jobs[name] = {"key": key, "goals": goals, "desc": jc.get("desc", "")}
+
+            # Two jobs bound to the same key: one becomes silently unreachable.
+            by_key = {}
+            for name, conf_j in jobs.items():
+                k = conf_j["key"]
+                if not k:
+                    continue
+                if k in by_key:
+                    _cfg_error(f"key '{k}' is used by both '{by_key[k]}' and "
+                               f"'{name}'")
+                by_key[k] = name
 
     if args.job:
         default_job = args.job
@@ -648,8 +714,7 @@ def main():
     trigger = threading.Event()
     trigger.set()  # build immediately on startup
 
-    roots = find_watch_roots(cwd, watch_extra)
-    threading.Thread(target=watcher_thread, args=(state, trigger, roots, interval),
+    threading.Thread(target=watcher_thread, args=(state, trigger, cwd, watch_extra, interval),
                      daemon=True).start()
     threading.Thread(target=runner_thread, args=(state, trigger, jobs, mvn, extra_args, cwd),
                      daemon=True).start()

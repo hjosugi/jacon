@@ -1,4 +1,4 @@
- jbacon 0.1.0  job:check  mvn  fail  2 errors, 0 warnings
+ jbacon 0.2.0  job:check  mvn  fail  2 errors, 0 warnings
 E src/main/java/com/example/Calc.java:9:21
    ';' expected
 E Failed to execute goal
