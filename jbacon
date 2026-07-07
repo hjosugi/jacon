@@ -57,7 +57,7 @@ DEFAULT_JOBS = {
     "package": {"key": "p", "goals": ["package", "-DskipTests"], "desc": "package without tests"},
 }
 
-RESERVED_KEYS = set("roqshjkgG")
+RESERVED_KEYS = set("roqswhjkgG")
 
 # Maven compiler / plugin message with a source location:
 #   [ERROR] /abs/path/Foo.java:[12,5] ';' expected
