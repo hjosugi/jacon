@@ -1,3 +1,6 @@
+<!-- i18n: language-switcher -->
+[English](README.en.md) | [日本語](README.md)
+
 # jbacon
 
 Maven プロジェクト用の bacon 風バックグラウンドコードチェッカー。
